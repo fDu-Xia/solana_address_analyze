@@ -1,7 +1,9 @@
 from fontTools.merge.util import current_time
+from solana.exceptions import SolanaRpcException
 from solana.rpc.api import Client
 import time
 from solders.pubkey import Pubkey
+from solders.transaction_status import ParsedAccount
 import networkx as nx
 import matplotlib.pyplot as plt
 
@@ -50,13 +52,16 @@ def get_token_receiver(address:str, tx_data, target_mint: str):
     except (KeyError, TypeError):
         return []
 
-def get_sol_receiver(address:str,tx_data,receiver_counts:int):
+def get_sol_receiver(address,tx_data,receiver_counts:int):
     try:
         account_keys = tx_data.value.transaction.transaction.message.account_keys
-        index = account_keys.index(address)
-        end_index = index + 1 + receiver_counts
-        return account_keys[index + 1:end_index]
-    except (KeyError, TypeError,ValueError):
+        for index, account_key in enumerate(account_keys):
+            if index == 0 and account_key.pubkey != address:
+                return []
+            if account_key.pubkey == address:
+                end_index = index + 1 + receiver_counts
+                return account_keys[index + 1:end_index]
+    except (KeyError, TypeError,ValueError) as e:
         return []
 
 class SolanaTransferAnalyzer:
@@ -68,9 +73,10 @@ class SolanaTransferAnalyzer:
         for address in addresses:
             self.graph.add_node(address)
 
-    def add_edge(self,node,neighbors):
+    def add_edge(self,node,neighbors,wallets):
         for neighbor in neighbors:
-            self.graph.add_edge(node,neighbor)
+            if neighbor in wallets:
+                self.graph.add_edge(node,neighbor)
 
     def print_all_connected_subgraph(self, max_node_count):
         for c in nx.connected_components(self.graph):
@@ -95,55 +101,71 @@ class SolanaTransferAnalyzer:
                 for sig_info in signatures.value:
                     if current - sig_info.block_time > time_interval:
                         return neighbors
-                    try:
-                        # 获取交易详情
-                        tx_data = self.client.get_transaction(
-                            sig_info.signature,
-                            encoding="jsonParsed",
-                            max_supported_transaction_version=0
-                        )
-                        if mint_address == 'sol':
-                            count = is_sol_transfer(tx_data)
-                            if count > 0:
-                                receivers = get_sol_receiver(address, tx_data, count)
-                                neighbors.extend(receivers)
-                        else:
-                            if is_token_transfer(tx_data):
-                                receivers = get_token_receiver(address, tx_data, mint_address)
-                                neighbors.extend(receivers)
+                    retry_count = 0
+                    while retry_count < 5:
+                        try:
+                            # 获取交易详情
+                            tx_data = self.client.get_transaction(
+                                sig_info.signature,
+                                encoding="jsonParsed",
+                                max_supported_transaction_version=0
+                            )
+                            if mint_address == 'sol':
+                                count = is_sol_transfer(tx_data)
+                                if count > 0:
+                                    receivers = get_sol_receiver(addressPub, tx_data, count)
+                                    receivers_str = [str(receiver.pubkey) for receiver in receivers]
+                                    neighbors.extend(receivers_str)
+                            else:
+                                if is_token_transfer(tx_data):
+                                    receivers = get_token_receiver(address, tx_data, mint_address)
+                                    neighbors.extend(receivers)
 
-                        # 添加延时以避免请求过快
-                        time.sleep(0.1)
-
-                    except Exception as e:
-                        print(f"Error processing transaction {sig_info.signature}: {str(e)}")
-                        continue
+                            # 添加延时以避免请求过快
+                            time.sleep(0.1)
+                            break
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count < 5:
+                                print(f"Error on transaction {sig_info.signature}, retry {retry_count}/5: {e!r}")
+                                time.sleep(1)  # RPC 异常等待1秒
+                                continue
+                            else:
+                                print(f"Max retries reached for transaction {sig_info.signature}: {e!r}")
             except Exception as e:
-                print(f"Error occurred: {str(e)}")
+                print(f"Error occurred: {e!r}")
 
 
 def main():
     # 初始化
     analyzer = SolanaTransferAnalyzer()
     #如果是sol
-    #token_mint = "sol"
+    token_mint = "sol"
 
     #ava为例
-    token_mint = "DKu9kykSfbN5LBfFXtNNDPaX35o4Fv6vJ9FKk7pZpump"
+    # token_mint = "DKu9kykSfbN5LBfFXtNNDPaX35o4Fv6vJ9FKk7pZpump"
     wallet1 = "8SJR9CNrANJvgWVND9ZPNHK6va6VCC3p7NBSx8c3hotM"
     wallet2 = "w6AovkEzgdQYt6yJDN7atHMkRQv877FpXWvRKouv6Gc"
     wallet3 = "DnzPxMvaYutWV9ULiErSXMTvqcJ1gkN1qvHN4bqGLovB"
 
+    # token_mint = "AxriehR6Xw3adzHopnvMn7GcpRFcD41ddpiTWMg6pump"
     wallets = [wallet1,wallet2,wallet3]
-
+    # wallets = [
+    #     "EoDNaQCm3iCGdhCXUoKB7tGe4CYJDEcQv4GJi3LLsf6C",
+    #     "GRqyEP4jpDgTW8im2hNwWgGLk6GozZ4bM5pLRUShkBUV",
+    #     "J9nMxfmxPjRnd3UrxazTSViEbwyru3Pzt5pwa1Sdcs4g",
+    #     "CCMJ8aCwkDwDyZXV3KVANxpZiwBgg9u4UCeCX1hTTdrM",
+    #     "3XcHbc5Z7GfM3nXkP7NE8GT7ZawVsekxEfmPCofD1kcc"
+    # ]
     analyzer.construct_graph(wallets)
 
     #只看七天内的交易
-    seven_days_in_seconds = 604800
+    seven_days_in_seconds = 604800*10
 
     for wallet in wallets:
         neighbors = analyzer.get_graph_neighbour(wallet, token_mint,seven_days_in_seconds)
-        analyzer.add_edge(wallet,neighbors)
+        analyzer.add_edge(wallet,neighbors,wallets)
+        print(f"{wallet} analyze completed")
 
     #打印结果：只打印节点数量小于3的集群
     analyzer.print_all_connected_subgraph(3)
